@@ -1,9 +1,10 @@
+// src/utils/date-utils.ts
 import { DateTime } from "luxon";
 import { Shift } from "../reflow/types";
 import { Interval, pushOutOfBlocked, sortIntervals } from "./interval-utils";
 
 /**
- * Build shift interval for the day of `day` (in UTC).
+ * Build a shift interval for a specific day (UTC).
  */
 function shiftIntervalForDay(day: DateTime, shift: Shift): Interval {
   const start = day.set({
@@ -23,8 +24,8 @@ function shiftIntervalForDay(day: DateTime, shift: Shift): Interval {
 
 /**
  * Find the next shift window that contains or follows the cursor.
- * If cursor is during a working shift -> returns that shift window.
- * Else -> returns next shift window in future.
+ * - If cursor is during a shift -> returns window [max(cursor, shiftStart), shiftEnd)
+ * - Else -> returns next shift window in the future
  */
 export function findNextShiftWindow(
   cursor: DateTime,
@@ -34,30 +35,29 @@ export function findNextShiftWindow(
     throw new Error("No shifts defined for work center.");
   }
 
-  // We search up to 14 days ahead to avoid infinite loops
+  // Search horizon (defensive): 14 days
   for (let d = 0; d < 14; d++) {
     const day = cursor.plus({ days: d }).startOf("day");
-    const dow = day.weekday % 7; // Luxon weekday: Mon=1..Sun=7; convert to 0..6 with Sun=0
+    const dow = day.weekday % 7; // Luxon: Mon=1..Sun=7 -> 0..6 with Sun=0
 
-    const dayShifts = shifts
+    const dayWindows = shifts
       .filter((s) => s.dayOfWeek === dow)
       .map((s) => shiftIntervalForDay(day, s))
       .sort((a, b) => a.start.toMillis() - b.start.toMillis());
 
-    if (dayShifts.length === 0) continue;
+    if (dayWindows.length === 0) continue;
 
-    // If we're checking current day (d==0), consider cursor position
     if (d === 0) {
-      for (const w of dayShifts) {
+      // Same day: return first window whose end is after cursor
+      for (const w of dayWindows) {
         if (cursor < w.end) {
-          // If cursor is before shift start, snap to shift start
           return { start: cursor < w.start ? w.start : cursor, end: w.end };
         }
       }
+      // cursor after all shifts today -> continue to next day
     } else {
-      // future day: take first shift window fully
-      const w = dayShifts[0];
-      return { start: w.start, end: w.end };
+      // Future day: return first shift window
+      return { start: dayWindows[0].start, end: dayWindows[0].end };
     }
   }
 
@@ -67,7 +67,9 @@ export function findNextShiftWindow(
 /**
  * Allocate `durationMinutes` starting from `startISO` within shift windows,
  * skipping blocked intervals (maintenance + already scheduled orders).
- * Returns { start, end } ISO strings.
+ *
+ * Returns an elapsed start and end time (ISO UTC). The elapsed span may cross
+ * non-working or blocked periods because work pauses and resumes.
  */
 export function scheduleWithShiftsAndBlocks(params: {
   startISO: string;
@@ -80,41 +82,47 @@ export function scheduleWithShiftsAndBlocks(params: {
 
   const blockedSorted = sortIntervals(params.blocked);
 
-  // Ensure we start outside blocked time
+  // Ensure initial cursor is not inside blocked time
   cursor = pushOutOfBlocked(cursor, blockedSorted);
 
-  const scheduledStart = cursor;
+  // The scheduled start is the first time we can actually begin work (may be moved by constraints)
+  let scheduledStart: DateTime | null = null;
 
   while (remaining > 0) {
-    // Find next available shift window
+    // 1) Find next available shift window (may begin in the future)
     const shiftWindow = findNextShiftWindow(cursor, params.shifts);
 
-    // Move out of blocked if cursor sits inside blocked
-    cursor = pushOutOfBlocked(cursor, blockedSorted);
+    // 2) Hard clamp cursor to shift start (CRITICAL to prevent "working" outside shifts)
+    if (cursor < shiftWindow.start) cursor = shiftWindow.start;
 
-    // If we got pushed beyond shift end, loop to find next shift
+    // 3) Push out of blocked time; then clamp again to shift start (in case we moved backward logically)
+    cursor = pushOutOfBlocked(cursor, blockedSorted);
+    if (cursor < shiftWindow.start) cursor = shiftWindow.start;
+
+    // 4) If we're past the shift end, advance and loop
     if (cursor >= shiftWindow.end) {
-      cursor = shiftWindow.end.plus({ minutes: 1 }); // nudge forward
+      cursor = shiftWindow.end.plus({ minutes: 1 });
       continue;
     }
 
-    // Work can only happen within shiftWindow.end
+    // Record the real scheduled start once (first time we actually can work)
+    if (!scheduledStart) scheduledStart = cursor;
+
+    // 5) Find the next block that could cut the current shift segment
     const shiftEnd = shiftWindow.end;
 
-    // But maintenance/booking may cut into it: find the next blocked interval after cursor
     let nextBlockStart: DateTime | null = null;
     let nextBlockEnd: DateTime | null = null;
 
     for (const b of blockedSorted) {
-      if (b.end <= cursor) continue;
-      if (b.start >= shiftEnd) break;
-      // first relevant block
+      if (b.end <= cursor) continue; // block entirely before cursor
+      if (b.start >= shiftEnd) break; // blocks after shift end don't matter now
       nextBlockStart = b.start;
       nextBlockEnd = b.end;
       break;
     }
 
-    // Compute free segment end: min(shiftEnd, nextBlockStart)
+    // 6) Compute the free segment end: min(shiftEnd, nextBlockStart (if in future))
     const freeEnd =
       nextBlockStart && nextBlockStart > cursor
         ? nextBlockStart < shiftEnd
@@ -123,7 +131,7 @@ export function scheduleWithShiftsAndBlocks(params: {
         : shiftEnd;
 
     if (freeEnd <= cursor) {
-      // cursor is at/after freeEnd; maybe due to block starting now
+      // No usable free time; likely block starts at cursor
       if (nextBlockEnd) {
         cursor = nextBlockEnd;
         continue;
@@ -133,19 +141,26 @@ export function scheduleWithShiftsAndBlocks(params: {
     }
 
     const freeMinutes = Math.floor(freeEnd.diff(cursor, "minutes").minutes);
-
     if (freeMinutes <= 0) {
       cursor = freeEnd.plus({ minutes: 1 });
       continue;
     }
 
+    // 7) Consume working minutes
     const used = Math.min(remaining, freeMinutes);
     remaining -= used;
     cursor = cursor.plus({ minutes: used });
 
-    // If we still have work left and we're inside a block or out of shift, loop will find next segment
+    // 8) If we landed inside blocked time, push out and keep going
     cursor = pushOutOfBlocked(cursor, blockedSorted);
   }
 
-  return { startISO: scheduledStart.toISO()!, endISO: cursor.toISO()! };
+  // If durationMinutes was 0, define start=end at cursor
+  if (!scheduledStart)
+    scheduledStart = DateTime.fromISO(params.startISO, { zone: "utc" });
+
+  return {
+    startISO: scheduledStart.toISO()!,
+    endISO: cursor.toISO()!,
+  };
 }

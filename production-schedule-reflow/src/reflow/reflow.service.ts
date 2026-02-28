@@ -1,3 +1,4 @@
+// src/reflow/reflow.service.ts
 import { DateTime } from "luxon";
 import {
   Change,
@@ -19,42 +20,47 @@ export class ReflowService {
     const wcMap = new Map<string, WorkCenter>(
       input.workCenters.map((w) => [w.docId, w]),
     );
+
+    // Clone work orders so we don't mutate caller input
     const woMap = new Map<string, WorkOrder>(
       input.workOrders.map((w) => [w.docId, structuredClone(w)]),
     );
 
-    // Topological order ensures dependencies scheduled first
+    // 1) Enforce dependency correctness (includes cycle detection)
     const topoIds = topoSortWorkOrders(Array.from(woMap.values()));
 
-    // Per work center: blocked intervals = maintenance windows + scheduled work orders
-    const centerBooked = new Map<string, Interval[]>();
+    // 2) Per work center blocked intervals = maintenance windows + already scheduled work orders
+    const centerBlocked = new Map<string, Interval[]>();
     for (const wc of input.workCenters) {
-      centerBooked.set(wc.docId, buildMaintenanceIntervals(wc));
+      centerBlocked.set(wc.docId, buildMaintenanceIntervals(wc));
     }
 
-    // First, lock maintenance work orders into schedule (immovable)
-    // They still occupy the work center
+    // 3) Lock maintenance work orders (immovable) - they still occupy the work center
     for (const wo of woMap.values()) {
       if (!wo.data.isMaintenance) continue;
-      const booked = centerBooked.get(wo.data.workCenterId);
-      if (!booked)
-        throw new Error(`Missing center bookings: ${wo.data.workCenterId}`);
-      booked.push(buildOrderInterval(wo));
-      centerBooked.set(wo.data.workCenterId, sortIntervals(booked));
+
+      const blocked = centerBlocked.get(wo.data.workCenterId);
+      if (!blocked) throw new Error(`Missing center: ${wo.data.workCenterId}`);
+
+      blocked.push(buildOrderInterval(wo));
+      centerBlocked.set(wo.data.workCenterId, sortIntervals(blocked));
     }
 
     const changes: Change[] = [];
     const explanation: string[] = [];
 
-    // For dependency lookup of computed end times
+    // Store scheduled results in topo order (for dependency lookups)
     const scheduled = new Map<string, WorkOrder>();
 
+    // 4) Schedule in topo order
     for (const id of topoIds) {
-      const wo = woMap.get(id)!;
+      const wo = woMap.get(id);
+      if (!wo) throw new Error(`Missing work order: ${id}`);
+
       const wc = wcMap.get(wo.data.workCenterId);
       if (!wc) throw new Error(`Work center missing: ${wo.data.workCenterId}`);
 
-      // Maintenance orders are immovable; just record them
+      // Maintenance orders are locked — just record and continue
       if (wo.data.isMaintenance) {
         scheduled.set(id, wo);
         continue;
@@ -63,34 +69,35 @@ export class ReflowService {
       const originalStart = wo.data.startDate;
       const originalEnd = wo.data.endDate;
 
-      // Earliest start based on dependencies
+      // 4.1) Earliest start = max(original start, latest parent end)
       let earliest = DateTime.fromISO(wo.data.startDate, { zone: "utc" });
 
       if (wo.data.dependsOnWorkOrderIds.length > 0) {
         let latestParentEnd = earliest;
+
         for (const parentId of wo.data.dependsOnWorkOrderIds) {
           const parent = scheduled.get(parentId);
           if (!parent) {
             throw new Error(
-              `Parent not scheduled yet (unexpected): ${parentId}`,
+              `Parent not scheduled yet (unexpected topo issue): ${parentId}`,
             );
           }
-          const parentEnd = DateTime.fromISO(parent.data.endDate, {
-            zone: "utc",
-          });
-          if (parentEnd > latestParentEnd) latestParentEnd = parentEnd;
+
+          const pEnd = DateTime.fromISO(parent.data.endDate, { zone: "utc" });
+          if (pEnd > latestParentEnd) latestParentEnd = pEnd;
         }
+
         earliest = latestParentEnd;
       }
 
-      // Total working minutes includes optional setup time
+      // 4.2) Working minutes required (duration + optional setup)
       const totalMinutes =
         wo.data.durationMinutes + (wo.data.setupTimeMinutes ?? 0);
 
-      // Blocked intervals: maintenance + already scheduled orders on this center
-      const blocked = sortIntervals(centerBooked.get(wc.docId) ?? []);
+      // 4.3) Blocked = maintenance + already scheduled orders on the same center
+      const blocked = sortIntervals(centerBlocked.get(wc.docId) ?? []);
 
-      // Schedule within shifts and blocks
+      // 4.4) Schedule using shift + blocked-time aware allocator
       const { startISO, endISO } = scheduleWithShiftsAndBlocks({
         startISO: earliest.toISO()!,
         durationMinutes: totalMinutes,
@@ -98,16 +105,15 @@ export class ReflowService {
         blocked,
       });
 
-      // Update work order
       wo.data.startDate = startISO;
       wo.data.endDate = endISO;
 
-      // Add this work order to bookings for this center
-      const bookedNow = centerBooked.get(wc.docId) ?? [];
-      bookedNow.push(buildOrderInterval(wo));
-      centerBooked.set(wc.docId, sortIntervals(bookedNow));
+      // 4.5) Add this work order to blocked intervals for this work center
+      const blockedNow = centerBlocked.get(wc.docId) ?? [];
+      blockedNow.push(buildOrderInterval(wo));
+      centerBlocked.set(wc.docId, sortIntervals(blockedNow));
 
-      // Record change
+      // 4.6) Record changes
       if (
         originalStart !== wo.data.startDate ||
         originalEnd !== wo.data.endDate
@@ -138,12 +144,12 @@ export class ReflowService {
       "Orders are processed in dependency order (topological sort). Maintenance work orders are locked and occupy capacity.",
     );
     explanation.push(
-      "Each work order is scheduled using working-minutes allocation inside shift windows, skipping maintenance windows and existing bookings.",
+      "Each work order is scheduled by allocating working minutes inside shift windows while skipping maintenance windows and existing bookings.",
     );
 
     const updatedWorkOrders = topoIds
-      .map((id) => scheduled.get(id)!)
-      .filter(Boolean);
+      .map((id) => scheduled.get(id))
+      .filter((x): x is WorkOrder => Boolean(x));
 
     const totalDelayMinutes = changes.reduce(
       (sum, c) => sum + Math.max(0, c.deltaMinutes),
