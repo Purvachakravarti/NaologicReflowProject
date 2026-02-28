@@ -8,6 +8,7 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "verbatimModuleSyntax": false
+    "verbatimModuleSyntax": false,
+    "types": ["node", "jest"]
   }
 }
