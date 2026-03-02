@@ -1,9 +1,10 @@
 {
   "name": "production-schedule-reflow",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc",
     "start": "node dist/index.js",
     "test": "jest",
