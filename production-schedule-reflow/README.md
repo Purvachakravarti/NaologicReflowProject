@@ -107,3 +107,5 @@ When you run npm run dev, the CLI prints:
 
 - This is a deterministic forward scheduler, not an optimization solver.
   @upgrade: add objective functions (minimize total delay, minimize number of moved orders, maximize utilization).
+
+Loom Video Link: https://www.loom.com/share/751edd5a97484785bc8f53cd485c8476
