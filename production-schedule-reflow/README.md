@@ -2,77 +2,108 @@
 
 ## Overview
 
-This project implements a production schedule **reflow algorithm** for a manufacturing facility.  
+This project implements a production schedule **reflow algorithm** for a manufacturing facility.
 When disruptions occur (delays, breakdowns, maintenance), it reschedules work orders while respecting:
 
-- Dependencies (A must finish before B)
-- Work center capacity (no overlaps)
-- Shift boundaries (work pauses outside shifts)
-- Maintenance windows (blocked time)
-- Maintenance work orders are immovable
+- **Dependencies** (A must finish before B; multiple parents supported)
+- **Work center capacity** (no overlaps per work center)
+- **Shift boundaries** (work pauses outside shifts and resumes next shift)
+- **Maintenance windows** (blocked time periods)
+- **Maintenance work orders** are **immovable** (locked in place)
 
-All dates are treated as **UTC ISO strings**.
+All timestamps are treated as **UTC ISO strings**.
 
 ## Tech
 
 - TypeScript (strict)
-- Luxon (date/time in UTC)
+- Luxon (UTC date/time)
 
 ## How to run
 
-```bash
-node -v
-npm -v
+### Prerequisites
 
-npm init -y
+- Node.js + npm installed
 
-npm install luxon
-npm install -D typescript ts-node-dev @types/node @types/luxon
+### Install
 
-npx tsc --init
+npm install
+
+## Run (dev)
+
 npm run dev
-```
 
-## Algorithm (High-level)
+## Run tests (bonus)
 
-Build a dependency graph of work orders.
+npm test
+Build + run compiled output
+npm run build
+npm start
 
-Topologically sort (cycle detection included).
+## Project structure
 
-For each work order in topo order:
+src/
+reflow/
+types.ts # Domain types
+dag.ts # Topological sort + cycle detection
+constraint-checker.ts # Validation helpers
+reflow.service.ts # Main orchestration logic
+utils/
+interval-utils.ts # Interval helpers
+date-utils.ts # Shift + blocked-time scheduling engine
+sample-data/
+scenarios.ts # 3 demo scenarios
+index.ts # CLI runner
+prompts/
+ai-prompts.md # AI prompts used (bonus)
 
-If maintenance work order: keep fixed, add as booked interval.
+### Algorithm (high-level)
 
-Else:
+1. Build a dependency graph of work orders.
 
-Compute earliest start = max(originalStart, latestParentEnd).
+2. Topologically sort it (cycle detection included).
 
-Schedule required working minutes inside shift windows, skipping:
+3. Maintain blocked intervals per work center:
+   - maintenance windows
+   - already scheduled work orders
+   - locked (immovable) maintenance work orders
 
-maintenance windows
+4. For each work order in topo order:
+   - If isMaintenance === true: keep fixed and add it to blocked intervals.
+   - Else:
+     => Compute earliestStart = max(originalStart, latestParentEnd).
+     => Allocate required working minutes inside shift windows while skipping blocked intervals.
 
-existing bookings on the work center
+5. Return:
+   - updated schedule
+   - list of changes
+   - explanation
+   - simple metrics (total delay minutes, moved count)
 
-Output updated schedule + list of changes + explanation + metrics.
-
-Scenarios
+## Scenarios
 
 src/sample-data/scenarios.ts includes:
 
-Delay cascade (A -> B -> C)
+1. Delay cascade (A → B → C)
 
-Shift spanning (pause/resume across shifts)
+2. Shift spanning (pause/resume across shift boundary)
 
-Maintenance conflict + immovable maintenance work order
+3. Maintenance conflict + locked maintenance work order
 
-### In the terminal:
+When you run npm run dev, the CLI prints:
 
-You’ll see all 3 scenarios printed with:
+1. changes (before/after timestamps + delta)
 
-what changed
+2. updated work orders
 
-updated start/end
+3. explanation
 
-explanation
+4. metrics
 
-metrics
+### Notes / Trade-offs
+
+- Single-interval representation: each work order is represented as a single elapsed [startDate, endDate].
+  This guarantees a valid schedule and simplifies conflict checking.
+  @upgrade: return work segments (actual working intervals) to allow interleaving during pauses and to validate “no work during maintenance” at segment level.
+
+- This is a deterministic forward scheduler, not an optimization solver.
+  @upgrade: add objective functions (minimize total delay, minimize number of moved orders, maximize utilization).
